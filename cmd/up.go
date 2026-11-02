@@ -34,10 +34,12 @@ func NewUpload() *cobra.Command {
 	}
 
 	const (
-		_chat   = "chat"
-		path    = "path"
-		include = "include"
-		exclude = "exclude"
+		_chat     = "chat"
+		path      = "path"
+		include   = "include"
+		exclude   = "exclude"
+		_continue = "continue"
+		restart   = "restart"
 	)
 	cmd.Flags().StringVarP(&opts.Chat, _chat, "c", "", "chat id or domain, and empty means 'Saved Messages'. Can be used together with --topic flag. Conflicts with --to flag.")
 	cmd.Flags().IntVar(&opts.Thread, "topic", 0, "specify topic id. Must be used together with --chat flag. Conflicts with --to flag.")
@@ -47,11 +49,16 @@ func NewUpload() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&opts.Excludes, exclude, "e", []string{}, "exclude the specified file extensions")
 	cmd.Flags().BoolVar(&opts.Remove, "rm", false, "remove the uploaded files after uploading")
 	cmd.Flags().BoolVar(&opts.Photo, "photo", false, "upload the image as a photo instead of a file")
-	cmd.Flags().StringVar(&opts.Caption, "caption", `"<code>"+FileName+"</code> - <code>"+MIME+"</code>"`, "caption for the uploaded media")
+	cmd.Flags().StringVar(&opts.Caption, "caption", up.DefaultCaption, "caption for the uploaded media, the file name by default")
+
+	// resume flags, if both false then ask user
+	cmd.Flags().BoolVar(&opts.Continue, _continue, false, "skip files uploaded by the last unfinished upload directly")
+	cmd.Flags().BoolVar(&opts.Restart, restart, false, "forget the last unfinished upload and upload all files again")
 
 	// completion and validation
 	_ = cmd.MarkFlagRequired(path)
 	cmd.MarkFlagsMutuallyExclusive(include, exclude)
+	cmd.MarkFlagsMutuallyExclusive(_continue, restart)
 
 	return cmd
 }

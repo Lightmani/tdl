@@ -37,6 +37,8 @@ func IsImage(mime string) bool {
 }
 
 // GetMP4Info returns duration, width, height, error
+//
+// Deprecated: it only supports H.264 tracks in MP4, use GetVideoInfo instead.
 func GetMP4Info(r io.ReadSeeker) (int, int, int, error) {
 	d := mp4.CreateMp4Demuxer(r)
 

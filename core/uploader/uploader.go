@@ -3,7 +3,6 @@ package uploader
 import (
 	"context"
 	"io"
-	"time"
 
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-faster/errors"
@@ -44,28 +43,41 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 	for u.opts.Iter.Next(wgctx) {
 		elem := u.opts.Iter.Value()
 
-		wg.Go(func() (rerr error) {
+		wg.Go(func() error {
 			u.opts.Progress.OnAdd(elem)
-			defer func() { u.opts.Progress.OnDone(elem, rerr) }()
 
-			if err := u.upload(wgctx, elem); err != nil {
-				// canceled by user, so we directly return error to stop all
-				if errors.Is(err, context.Canceled) {
-					return errors.Wrap(err, "upload")
-				}
+			err := u.safeUpload(wgctx, elem)
+			// always report the real result, so the caller can log failures and must not treat them as success
+			u.opts.Progress.OnDone(elem, err)
 
-				// don't return error, just log it
+			// Only stop all uploads when the whole batch is canceled (e.g. by user).
+			// A failure of one file is reported by Progress.OnDone and must not abort the others.
+			if err != nil && ctx.Err() != nil {
+				return errors.Wrap(err, "upload")
 			}
 
 			return nil
 		})
 	}
 
+	// wait for in-flight uploads first, so that all of their results are reported before returning
+	werr := wg.Wait()
 	if err := u.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")
 	}
 
-	return wg.Wait()
+	return werr
+}
+
+// safeUpload isolates a panic caused by a single (malformed) file from the whole batch.
+func (u *Uploader) safeUpload(ctx context.Context, elem Elem) (rerr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			rerr = errors.Errorf("panic: %v", r)
+		}
+	}()
+
+	return u.upload(ctx, elem)
 }
 
 func (u *Uploader) upload(ctx context.Context, elem Elem) error {
@@ -127,16 +139,16 @@ func (u *Uploader) upload(ctx context.Context, elem Elem) error {
 		// upload as photo
 		media = message.UploadedPhoto(f, caption)
 	case mediautil.IsVideo(mime.String()):
-		// reset reader
-		if _, err = elem.File().Seek(0, io.SeekStart); err != nil {
-			return errors.Wrap(err, "seek file")
-		}
-		if dur, w, h, err := mediautil.GetMP4Info(elem.File()); err == nil {
-			// #132. There may be some errors, but we can still upload the file
-			media = doc.Video().
-				Duration(time.Duration(dur)*time.Second).
-				Resolution(w, h).
-				SupportsStreaming()
+		// Any codec (H.264, HEVC, AV1, VP9...) in MP4/MOV/MKV/WebM is sent as a video, so it can be previewed.
+		// #132. If the container can't be parsed (e.g. AVI, broken file), we still upload it, but as a file.
+		if info, err := mediautil.GetVideoInfo(elem.File()); err == nil {
+			video := doc.Video().
+				Duration(info.Duration).
+				Resolution(info.Width, info.Height)
+			if info.Streamable {
+				video = video.SupportsStreaming()
+			}
+			media = video
 		}
 	case mediautil.IsAudio(mime.String()):
 		media = doc.Audio().Title(fsutil.GetNameWithoutExt(elem.File().Name()))

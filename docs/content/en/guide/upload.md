@@ -93,7 +93,7 @@ tdl up -p /path/to/file -t 8 -l 4
 
 ## Custom Caption
 
-Custom caption is based on [expression](/reference/expr).
+Custom caption is based on [expression](/reference/expr). The default caption is the file name with extension (`FileName + FileExt`).
 
 List all available fields:
 
@@ -104,6 +104,16 @@ tdl up -p /path/to/file --caption -
 Custom simple caption:
 {{< command >}}
 tdl up -p /path/to/file --caption 'FileName + " - uploaded by tdl"'
+{{< /command >}}
+
+File name without extension:
+{{< command >}}
+tdl up -p /path/to/file --caption 'FileName'
+{{< /command >}}
+
+No caption:
+{{< command >}}
+tdl up -p /path/to/file --caption '""'
 {{< /command >}}
 
 Write styled message with [HTML](https://core.telegram.org/bots/api#html-style):
@@ -164,6 +174,31 @@ Blacklist: Upload all files except `.mp4` `.flv` extension
 tdl up -p /path/to/file -p /path/to/dir -e mp4 -e flv
 {{< /command >}}
 
+## Resume/Restart
+
+A failed file doesn't stop the others. When the upload finishes, failed files are listed with their errors,
+and successfully uploaded files are recorded (immediately after each upload, so the record also survives a crash or `Ctrl+C`).
+
+Run the same command again to upload only the failed and remaining files. tdl asks whether to skip the uploaded files.
+Changed files (size or modification time) are always uploaded again.
+
+Resume without UI interaction:
+
+{{< command >}}
+tdl up -p /path/to/dir -c CHAT --continue
+{{< /command >}}
+
+Restart (upload all files again) without UI interaction:
+
+{{< command >}}
+tdl up -p /path/to/dir -c CHAT --restart
+{{< /command >}}
+
+{{< hint info >}}
+An upload is identified by its `-p` paths and destination (`-c`, `--topic`, `--to`), so adding new files to the directory doesn't break resuming.
+The record is deleted once all files are uploaded, so running the same command after a complete upload uploads all files again.
+{{< /hint >}}
+
 ## Delete Local
 
 Delete the uploaded file after uploading successfully:
@@ -179,3 +214,11 @@ Upload images as photos instead of documents:
 {{< command >}}
 tdl up -p /path/to/file --photo
 {{< /command >}}
+
+## Video
+
+Videos in MP4/MOV/M4V/3GP and MKV/WebM containers are uploaded as videos which can be previewed and played in Telegram,
+whatever their codec is (H.264, H.265/HEVC, AV1, VP9...). Their duration and resolution (rotation applied) are read from the file.
+Other containers (e.g. AVI, FLV) or broken files are uploaded as documents.
+
+To set a thumbnail for `video.mp4`, put a JPEG image named `video.thumb` next to it (Telegram requires it to be smaller than 200 KB and not larger than 320x320).

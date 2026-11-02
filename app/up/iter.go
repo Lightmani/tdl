@@ -23,6 +23,8 @@ import (
 type File struct {
 	File  string
 	Thumb string
+
+	id string // identity for resuming, see fileID
 }
 
 type dest struct {
@@ -34,19 +36,21 @@ type iter struct {
 	files   []*File
 	to      *vm.Program
 	caption *vm.Program
-	chat    string
+	chat    peers.Peer // pre-resolved --chat, nil if not set
 	topic   int
 	photo   bool
 	remove  bool
 	delay   time.Duration
 	manager *peers.Manager
+	// onError is called when a file can't be prepared for uploading. The file is skipped, others go on.
+	onError func(file *File, err error)
 
 	cur  int
 	err  error
 	file uploader.Elem
 }
 
-func newIter(files []*File, to, caption *vm.Program, chat string, topic int, photo, remove bool, delay time.Duration, manager *peers.Manager) *iter {
+func newIter(files []*File, to, caption *vm.Program, chat peers.Peer, topic int, photo, remove bool, delay time.Duration, manager *peers.Manager, onError func(file *File, err error)) *iter {
 	return &iter{
 		files:   files,
 		to:      to,
@@ -57,6 +61,7 @@ func newIter(files []*File, to, caption *vm.Program, chat string, topic int, pho
 		remove:  remove,
 		delay:   delay,
 		manager: manager,
+		onError: onError,
 
 		cur:  0,
 		err:  nil,
@@ -65,41 +70,46 @@ func newIter(files []*File, to, caption *vm.Program, chat string, topic int, pho
 }
 
 func (i *iter) Next(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		i.err = ctx.Err()
-		return false
-	default:
+	for {
+		select {
+		case <-ctx.Done():
+			i.err = ctx.Err()
+			return false
+		default:
+		}
+
+		if i.cur >= len(i.files) || i.err != nil {
+			return false
+		}
+
+		// if delay is set, sleep for a while for each iteration
+		if i.delay > 0 && i.cur > 0 { // skip first delay
+			time.Sleep(i.delay)
+		}
+
+		cur := i.files[i.cur]
+		i.cur++
+
+		file, err := i.next(ctx, cur)
+		if err != nil {
+			if ctx.Err() != nil { // canceled, stop the whole batch
+				i.err = ctx.Err()
+				return false
+			}
+
+			// one broken file must not stop the whole batch, report it and go on
+			if i.onError != nil {
+				i.onError(cur, err)
+			}
+			continue
+		}
+
+		i.file = file
+		return true
 	}
-
-	if i.cur >= len(i.files) || i.err != nil {
-		return false
-	}
-
-	// if delay is set, sleep for a while for each iteration
-	if i.delay > 0 && i.cur > 0 { // skip first delay
-		time.Sleep(i.delay)
-	}
-
-	cur := i.files[i.cur]
-	i.cur++
-
-	file, err := i.next(ctx, cur)
-	if err != nil {
-		i.err = err
-		return false
-	}
-
-	i.file = file
-	return true
 }
 
 func (i *iter) next(ctx context.Context, cur *File) (*iterElem, error) {
-	file, err := i.resolveFile(cur.File)
-	if err != nil {
-		return nil, errors.Wrap(err, "resolve file")
-	}
-
 	env := exprEnv(ctx, cur)
 
 	to, thread, err := i.resolveDest(ctx, env)
@@ -112,12 +122,20 @@ func (i *iter) next(ctx context.Context, cur *File) (*iterElem, error) {
 		return nil, errors.Wrap(err, "resolve caption")
 	}
 
+	// open files at last, so they don't leak when other resolving fails
+	file, err := i.resolveFile(cur.File)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve file")
+	}
+
 	thumb, err := i.resolveThumb(cur.Thumb)
 	if err != nil {
+		_ = file.Close()
 		return nil, errors.Wrap(err, "resolve thumbnail")
 	}
 
 	return &iterElem{
+		id:      cur.id,
 		file:    file,
 		thumb:   thumb,
 		to:      to,
@@ -137,6 +155,7 @@ func (i *iter) resolveFile(path string) (*uploaderFile, error) {
 
 	stat, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
 		return nil, errors.Wrap(err, "stat file")
 	}
 
@@ -147,13 +166,8 @@ func (i *iter) resolveFile(path string) (*uploaderFile, error) {
 }
 
 func (i *iter) resolveDest(ctx context.Context, env Env) (peers.Peer, int, error) {
-	if i.chat != "" { // compatible with old version
-		to, err := i.resolvePeer(ctx, i.chat)
-		if err != nil {
-			return nil, 0, errors.Wrap(err, "resolve chat")
-		}
-
-		return to, i.topic, nil
+	if i.chat != nil { // compatible with old version
+		return i.chat, i.topic, nil
 	}
 
 	// message routing
