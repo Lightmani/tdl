@@ -11,3 +11,7 @@ func App() string {
 func Resume(fingerprint string) string {
 	return keygen.New("resume", fingerprint)
 }
+
+func UploadResume(fingerprint string) string {
+	return keygen.New("resume", "upload", fingerprint)
+}

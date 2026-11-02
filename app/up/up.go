@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"github.com/fatih/color"
@@ -31,6 +32,9 @@ import (
 	"github.com/iyear/tdl/pkg/utils"
 )
 
+// DefaultCaption is the file name, so each uploaded video shows its name below it.
+const DefaultCaption = `FileName + FileExt`
+
 type Options struct {
 	Chat     string
 	Thread   int
@@ -41,6 +45,9 @@ type Options struct {
 	Remove   bool
 	Photo    bool
 	Caption  string
+
+	// resume opts, if both false then ask user
+	Continue, Restart bool
 }
 
 type Env struct {
@@ -88,25 +95,119 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return errors.Wrap(err, "get caption")
 	}
 
+	// resolve the fixed chat once, so a wrong chat fails fast instead of failing every file
+	var chat peers.Peer
+	if opts.Chat != "" {
+		if chat, err = tutil.GetInputPeer(ctx, manager, opts.Chat); err != nil {
+			return errors.Wrap(err, "resolve chat")
+		}
+	}
+
+	jr := newJournal(kvd, batchFingerprint(opts))
+	if files, err = resume(ctx, jr, files, opts); err != nil {
+		return errors.Wrap(err, "resume")
+	}
+	if len(files) == 0 {
+		color.Green("All files have been uploaded")
+		return jr.clear(ctx)
+	}
+
 	upProgress := prog.New(utils.Byte.FormatBinaryBytes)
 	upProgress.SetNumTrackersExpected(len(files))
 	if !viper.GetBool(consts.FlagDisableProgressPS) {
 		prog.EnablePS(ctx, upProgress)
 	}
 
+	onError := func(f *File, err error) {
+		upProgress.Log(color.RedString("%s error: %s", f.File, err.Error()))
+		jr.markFailed(f.File, err)
+	}
+
 	options := uploader.Options{
 		Client:   pool.Default(ctx),
 		Threads:  viper.GetInt(consts.FlagThreads),
-		Iter:     newIter(files, to, caption, opts.Chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager),
-		Progress: newProgress(upProgress),
+		Iter:     newIter(files, to, caption, chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager, onError),
+		Progress: newProgress(ctx, upProgress, jr),
 	}
 
 	up := uploader.New(options)
 
 	go upProgress.Render()
-	defer prog.Wait(ctx, upProgress)
 
-	return up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	uerr := up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	prog.Wait(ctx, upProgress)
+
+	return summarize(ctx, jr, uerr)
+}
+
+// resume filters out files uploaded by the last unfinished batch.
+func resume(ctx context.Context, jr *journal, files []*File, opts Options) ([]*File, error) {
+	for _, f := range files {
+		f.id = fileID(f.File)
+	}
+
+	if opts.Restart {
+		color.Yellow("Restart upload by 'restart' flag")
+		return files, jr.clear(ctx)
+	}
+
+	if err := jr.load(ctx); err != nil {
+		return nil, err
+	}
+
+	pending := make([]*File, 0, len(files))
+	for _, f := range files {
+		if !jr.isDone(f.id) {
+			pending = append(pending, f)
+		}
+	}
+
+	skipped := len(files) - len(pending)
+	if skipped == 0 {
+		return files, nil
+	}
+
+	resumeStr := fmt.Sprintf("Found unfinished upload, %d/%d files have been uploaded", skipped, len(files))
+	confirm := true
+	if opts.Continue {
+		color.Yellow(resumeStr + ", skip them")
+	} else if err := survey.AskOne(&survey.Confirm{
+		Message: color.YellowString(resumeStr + ", skip them and continue?"),
+		Default: true,
+	}, &confirm); err != nil {
+		return nil, err
+	}
+
+	if !confirm {
+		return files, jr.clear(ctx)
+	}
+
+	logctx.From(ctx).Debug("Resume upload",
+		zap.Int("skipped", skipped),
+		zap.Int("pending", len(pending)))
+	return pending, nil
+}
+
+// summarize reports failed files and keeps the progress for resuming unless all files are uploaded.
+func summarize(ctx context.Context, jr *journal, uerr error) error {
+	failed := jr.failures()
+	if uerr == nil && len(failed) == 0 {
+		return jr.clear(ctx)
+	}
+
+	if len(failed) > 0 {
+		color.Red("%d file(s) failed to upload:", len(failed))
+		for _, f := range failed {
+			color.Red("  %s: %s", f.path, f.err.Error())
+		}
+	}
+	color.Yellow("Uploaded files are recorded. Run the same command again to upload the rest, " +
+		"add '--continue' to skip the confirmation, or '--restart' to upload all files again.")
+
+	if uerr != nil {
+		return uerr
+	}
+	return errors.Errorf("%d file(s) failed to upload", len(failed))
 }
 
 func resolveDest(ctx context.Context, manager *peers.Manager, input string) (*vm.Program, error) {

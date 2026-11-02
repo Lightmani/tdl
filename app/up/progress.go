@@ -1,6 +1,7 @@
 package up
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -15,8 +16,10 @@ import (
 )
 
 type progress struct {
+	ctx      context.Context // context of the whole batch, used to tell user cancellation from failures
 	pw       pw.Writer
 	trackers *sync.Map // map[tuple]*pw.Tracker
+	journal  *journal
 }
 
 type tuple struct {
@@ -24,10 +27,12 @@ type tuple struct {
 	to   int64
 }
 
-func newProgress(p pw.Writer) *progress {
+func newProgress(ctx context.Context, p pw.Writer, j *journal) *progress {
 	return &progress{
+		ctx:      ctx,
 		pw:       p,
 		trackers: &sync.Map{},
+		journal:  j,
 	}
 }
 
@@ -48,20 +53,32 @@ func (p *progress) OnUpload(elem uploader.Elem, state uploader.ProgressState) {
 }
 
 func (p *progress) OnDone(elem uploader.Elem, err error) {
+	e := elem.(*iterElem)
+	closeErr := p.closeFile(e) // always close files, even if upload failed
+
 	tracker, ok := p.trackers.Load(p.tuple(elem))
 	if !ok {
 		return
 	}
 	t := tracker.(*pw.Tracker)
-	e := elem.(*iterElem)
 
-	if err := p.closeFile(e); err != nil {
-		p.fail(t, elem, errors.Wrap(err, "close file"))
+	if err != nil {
+		if p.ctx.Err() != nil { // canceled by user, it will be uploaded when resuming
+			return
+		}
+
+		p.fail(t, elem, errors.Wrap(err, "upload"))
+		p.journal.markFailed(e.file.File.Name(), err)
 		return
 	}
 
-	if err != nil {
-		p.fail(t, elem, errors.Wrap(err, "progress"))
+	// uploaded successfully, persist it at once, so it can be skipped even if tdl is killed later
+	if err := p.journal.markDone(context.WithoutCancel(p.ctx), e.id); err != nil {
+		p.pw.Log(color.YellowString("%s warn: save upload progress: %s", p.elemString(elem), err.Error()))
+	}
+
+	if closeErr != nil {
+		p.fail(t, elem, closeErr)
 		return
 	}
 

@@ -12,6 +12,7 @@ import (
 )
 
 type iterElem struct {
+	id      string // identity for resuming, empty if unknown
 	file    *uploaderFile
 	thumb   *uploaderFile
 	to      peers.Peer
